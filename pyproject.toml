@@ -1,0 +1,17 @@
+[project]
+name = "llm-aphasia"
+version = "0.1.0"
+description = "A research toolkit to ablate Huggingface models by 'lesioning' parameters to a specified degree."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "AI Assistant", email = "assistant@example.com" }]
+
+[project.urls]
+Homepage = "https://github.com/example/llm-aphasia"
+Issues = "https://github.com/example/llm-aphasia/issues"
+
+[project.dependencies]
+torch >= "2.0.0"
+transformers >= "4.38.0"
+accelerate >= "0.29.0"
