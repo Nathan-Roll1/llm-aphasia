@@ -1,5 +1,5 @@
 import torch
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Union
 import warnings
 
 from .models import get_model_and_tokenizer
@@ -10,6 +10,7 @@ from .core import (
     apply_ablation_to_model,
     generate_text,
 )
+from .targeted import targeted_ablate
 
 # Global state to manage ablations applied to cached models
 _ABLATION_STATE: Dict[str, Dict] = {}
@@ -124,3 +125,6 @@ def ablate(
         raise RuntimeError(f"Failed to generate text: {str(e)}")
     
     return output
+
+# Export main functions
+__all__ = ['ablate', 'targeted_ablate']
