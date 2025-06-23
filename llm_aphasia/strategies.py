@@ -15,16 +15,26 @@ def _mean_out(tensor: torch.Tensor, severity: float, generator: torch.Generator)
 
 def _shuffle_dim(tensor: torch.Tensor, dim: int, severity: float, generator: torch.Generator) -> torch.Tensor:
     """Shuffles a fraction of indices along a given dimension."""
-    if tensor.dim() < 2: return tensor # Cannot shuffle 1D tensors meaningfully here
+    if tensor.dim() < 2: return tensor
     
+    ablated_tensor = tensor.clone()
     n_indices = tensor.shape[dim]
     n_to_shuffle = int(n_indices * severity)
-    if n_to_shuffle < 2: return tensor
+    if n_to_shuffle < 2: return ablated_tensor
 
+    # Select random indices to shuffle
     indices_to_shuffle = torch.randperm(n_indices, generator=generator, device=tensor.device)[:n_to_shuffle]
-    shuffled_indices = indices_to_shuffle[torch.randperm(n_to_shuffle, generator=generator, device=tensor.device)]
     
-    return torch.index_select(tensor, dim, shuffled_indices)
+    # Create a permutation of these indices
+    shuffled_order = indices_to_shuffle[torch.randperm(n_to_shuffle, generator=generator, device=tensor.device)]
+    
+    # Apply the shuffle by copying rows/columns
+    if dim == 0:  # Shuffle rows
+        ablated_tensor[indices_to_shuffle] = tensor[shuffled_order]
+    else:  # Shuffle columns
+        ablated_tensor[:, indices_to_shuffle] = tensor[:, shuffled_order]
+    
+    return ablated_tensor
 
 def _shuffle_y(tensor: torch.Tensor, severity: float, generator: torch.Generator) -> torch.Tensor:
     """Shuffles a fraction of rows (output dimension)."""
@@ -38,25 +48,37 @@ def _swap_dim(tensor: torch.Tensor, dim: int, severity: float, generator: torch.
     """Swaps pairs of indices along a given dimension, affecting a fraction of them."""
     if tensor.dim() < 2: return tensor
     
+    ablated_tensor = tensor.clone()
     n_indices = tensor.shape[dim]
     n_to_swap = int(n_indices * severity)
-    if n_to_swap < 2: return tensor
+    if n_to_swap < 2: return ablated_tensor
     
     # Ensure even number for pairing
     if n_to_swap % 2 != 0:
-        n_to_swap -=1
-
+        n_to_swap -= 1
+    
+    # Select random indices to swap
     indices_to_swap = torch.randperm(n_indices, generator=generator, device=tensor.device)[:n_to_swap]
-    swapped_indices = torch.arange(n_indices, device=tensor.device)
     
-    # Reshape to (pairs, 2) and swap columns
+    # Reshape to pairs and swap
     pairs = indices_to_swap.view(-1, 2)
-    swapped_pairs = torch.flip(pairs, dims=[1])
     
-    # Apply the swaps
-    swapped_indices[pairs.flatten()] = swapped_indices[swapped_pairs.flatten()]
+    if dim == 0:  # Swap rows
+        # Store the first of each pair
+        temp = ablated_tensor[pairs[:, 0]].clone()
+        # Copy second to first
+        ablated_tensor[pairs[:, 0]] = ablated_tensor[pairs[:, 1]]
+        # Copy temp (original first) to second
+        ablated_tensor[pairs[:, 1]] = temp
+    else:  # Swap columns
+        # Store the first of each pair
+        temp = ablated_tensor[:, pairs[:, 0]].clone()
+        # Copy second to first
+        ablated_tensor[:, pairs[:, 0]] = ablated_tensor[:, pairs[:, 1]]
+        # Copy temp (original first) to second
+        ablated_tensor[:, pairs[:, 1]] = temp
     
-    return torch.index_select(tensor, dim, swapped_indices)
+    return ablated_tensor
     
 def _swap_y(tensor: torch.Tensor, severity: float, generator: torch.Generator) -> torch.Tensor:
     """Swaps pairs of rows (output dimension)."""
@@ -75,12 +97,17 @@ def _global_shuffle(tensor: torch.Tensor, severity: float, generator: torch.Gene
     n_to_shuffle = int(n_elements * severity)
     if n_to_shuffle < 2: return tensor
     
+    # Select random indices to shuffle
     indices_to_shuffle = torch.randperm(n_elements, generator=generator, device=tensor.device)[:n_to_shuffle]
-    shuffled_subset = flat_tensor[indices_to_shuffle]
-    shuffled_subset = shuffled_subset[torch.randperm(n_to_shuffle, generator=generator, device=tensor.device)]
     
+    # Get values at these indices and shuffle them
+    values_to_shuffle = flat_tensor[indices_to_shuffle].clone()
+    shuffled_order = torch.randperm(n_to_shuffle, generator=generator, device=tensor.device)
+    shuffled_values = values_to_shuffle[shuffled_order]
+    
+    # Create ablated tensor and apply shuffled values
     ablated_tensor = flat_tensor.clone()
-    ablated_tensor[indices_to_shuffle] = shuffled_subset
+    ablated_tensor[indices_to_shuffle] = shuffled_values
     
     return ablated_tensor.view(original_shape)
 
