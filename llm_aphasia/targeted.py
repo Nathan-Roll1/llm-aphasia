@@ -1,0 +1,310 @@
+"""
+Targeted ablation functionality for specific layers and components.
+"""
+
+import torch
+import torch.nn as nn
+from typing import Optional, Dict, List, Union, Tuple
+import warnings
+
+from .models import get_model_and_tokenizer
+from .strategies import apply_tensor_ablation
+from .core import generate_text
+
+
+class ComponentTargeter:
+    """Helper class to identify and target specific model components."""
+    
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.model_type = self._detect_architecture()
+        self.layers = self._get_layers()
+        
+    def _detect_architecture(self) -> str:
+        """Detect the model architecture type."""
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            return 'llama'
+        elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            return 'gpt'
+        else:
+            raise ValueError("Unsupported model architecture")
+    
+    def _get_layers(self) -> List[nn.Module]:
+        """Get the transformer layers based on architecture."""
+        if self.model_type == 'llama':
+            return self.model.model.layers
+        elif self.model_type == 'gpt':
+            return self.model.transformer.h
+        else:
+            return []
+    
+    def get_component_module(self, layer_idx: int, component: str) -> Optional[nn.Module]:
+        """Get a specific component module from a layer."""
+        if layer_idx >= len(self.layers) or layer_idx < 0:
+            return None
+            
+        layer = self.layers[layer_idx]
+        
+        if self.model_type == 'llama':
+            # Llama-style component mapping
+            component_map = {
+                'q': lambda l: getattr(l.self_attn, 'q_proj', None),
+                'k': lambda l: getattr(l.self_attn, 'k_proj', None),
+                'v': lambda l: getattr(l.self_attn, 'v_proj', None),
+                'o': lambda l: getattr(l.self_attn, 'o_proj', None),
+                'gate_proj': lambda l: getattr(l.mlp, 'gate_proj', None),
+                'up_proj': lambda l: getattr(l.mlp, 'up_proj', None),
+                'down_proj': lambda l: getattr(l.mlp, 'down_proj', None),
+            }
+        elif self.model_type == 'gpt':
+            # GPT-style component mapping
+            component_map = {
+                'q': lambda l: getattr(l.attn, 'c_attn', None),  # Combined QKV
+                'k': lambda l: getattr(l.attn, 'c_attn', None),  # Combined QKV
+                'v': lambda l: getattr(l.attn, 'c_attn', None),  # Combined QKV
+                'o': lambda l: getattr(l.attn, 'c_proj', None),
+                'mlp_in': lambda l: getattr(l.mlp, 'c_fc', None),
+                'mlp_out': lambda l: getattr(l.mlp, 'c_proj', None),
+            }
+        else:
+            return None
+        
+        if component in component_map:
+            return component_map[component](layer)
+        
+        return None
+    
+    def get_mlp_modules(self, layer_idx: int) -> List[nn.Module]:
+        """Get all MLP modules from a layer."""
+        if layer_idx >= len(self.layers) or layer_idx < 0:
+            return []
+            
+        layer = self.layers[layer_idx]
+        modules = []
+        
+        if self.model_type == 'llama':
+            for attr in ['gate_proj', 'up_proj', 'down_proj']:
+                if hasattr(layer.mlp, attr):
+                    modules.append(getattr(layer.mlp, attr))
+        elif self.model_type == 'gpt':
+            for attr in ['c_fc', 'c_proj']:
+                if hasattr(layer.mlp, attr):
+                    modules.append(getattr(layer.mlp, attr))
+        
+        return modules
+
+
+def targeted_ablate(
+    model_path: str,
+    ablation_strategy: str,
+    severity: float,
+    text_input: str,
+    target_layers: Optional[Union[int, List[int]]] = None,
+    target_components: Optional[List[str]] = None,
+    random_seed: int = 42,
+    max_new_tokens: int = 50,
+) -> str:
+    """
+    Apply ablations to specific layers and components of a model.
+    
+    Args:
+        model_path: The name or path of the Hugging Face model.
+        ablation_strategy: The ablation strategy to apply.
+            Options: 'zero_out', 'mean_out', 'swap_x', 'swap_y', 
+            'shuffle_x', 'shuffle_y', 'global', 'unablated'.
+        severity: The degree of ablation, from 0.0 (none) to 1.0 (maximum).
+        text_input: The prompt to send to the model.
+        target_layers: Specific layer indices to target. 
+            None = all layers, int = single layer, list = multiple layers.
+        target_components: List of components to target.
+            Options: ['q', 'k', 'v', 'o', 'mlp', 'gate_proj', 'up_proj', 'down_proj']
+            None = all components.
+        random_seed: Seed for reproducibility of random ablations.
+        max_new_tokens: The maximum number of new tokens to generate.
+        
+    Returns:
+        The text generated by the ablated model.
+        
+    Examples:
+        # Ablate only attention in layers 0-5
+        output = targeted_ablate(
+            model_path="gpt2",
+            ablation_strategy="zero_out",
+            severity=0.5,
+            text_input="Hello world",
+            target_layers=list(range(6)),
+            target_components=['q', 'k', 'v', 'o']
+        )
+        
+        # Ablate only MLPs in layer 10
+        output = targeted_ablate(
+            model_path="gpt2",
+            ablation_strategy="shuffle_y",
+            severity=0.7,
+            text_input="The capital of France is",
+            target_layers=10,
+            target_components=['mlp']
+        )
+    """
+    # Validate inputs
+    if not (0.0 <= severity <= 1.0):
+        raise ValueError("Severity must be between 0.0 and 1.0.")
+    
+    valid_strategies = ['zero_out', 'mean_out', 'swap_x', 'swap_y', 'shuffle_x', 'shuffle_y', 'global', 'unablated']
+    if ablation_strategy not in valid_strategies:
+        raise ValueError(f"Invalid ablation strategy '{ablation_strategy}'. Must be one of: {valid_strategies}")
+    
+    if ablation_strategy == 'unablated':
+        severity = 0.0
+    
+    # Load model and tokenizer
+    model, tokenizer = get_model_and_tokenizer(model_path)
+    device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(random_seed)
+    
+    # Initialize component targeter
+    targeter = ComponentTargeter(model)
+    
+    # Process target layers
+    if target_layers is None:
+        target_layers = list(range(len(targeter.layers)))
+    elif isinstance(target_layers, int):
+        target_layers = [target_layers]
+    
+    # Process target components
+    if target_components is None:
+        if targeter.model_type == 'llama':
+            target_components = ['q', 'k', 'v', 'o', 'gate_proj', 'up_proj', 'down_proj']
+        else:  # GPT
+            target_components = ['q', 'k', 'v', 'o', 'mlp_in', 'mlp_out']
+    
+    # Save original weights
+    saved_weights = {}
+    
+    # Apply ablations if severity > 0
+    if severity > 0:
+        with torch.no_grad():
+            for layer_idx in target_layers:
+                if layer_idx >= len(targeter.layers) or layer_idx < 0:
+                    warnings.warn(f"Layer {layer_idx} out of range (model has {len(targeter.layers)} layers)")
+                    continue
+                
+                for component in target_components:
+                    if component == 'mlp':
+                        # Handle MLP as a special case - ablate all MLP subcomponents
+                        mlp_modules = targeter.get_mlp_modules(layer_idx)
+                        for i, module in enumerate(mlp_modules):
+                            key = f"layer{layer_idx}_mlp_{i}"
+                            saved_weights[key] = module.weight.data.clone()
+                            
+                            ablated = apply_tensor_ablation(
+                                module.weight.data,
+                                ablation_strategy,
+                                severity,
+                                generator
+                            )
+                            module.weight.data = ablated
+                    else:
+                        # Handle individual components
+                        module = targeter.get_component_module(layer_idx, component)
+                        if module is not None:
+                            key = f"layer{layer_idx}_{component}"
+                            saved_weights[key] = module.weight.data.clone()
+                            
+                            ablated = apply_tensor_ablation(
+                                module.weight.data,
+                                ablation_strategy,
+                                severity,
+                                generator
+                            )
+                            module.weight.data = ablated
+    
+    # Generate text
+    try:
+        output = generate_text(model, tokenizer, text_input, max_new_tokens)
+    finally:
+        # Always restore weights after generation
+        if saved_weights:
+            with torch.no_grad():
+                for layer_idx in target_layers:
+                    if layer_idx >= len(targeter.layers) or layer_idx < 0:
+                        continue
+                    
+                    for component in target_components:
+                        if component == 'mlp':
+                            mlp_modules = targeter.get_mlp_modules(layer_idx)
+                            for i, module in enumerate(mlp_modules):
+                                key = f"layer{layer_idx}_mlp_{i}"
+                                if key in saved_weights:
+                                    module.weight.data = saved_weights[key]
+                        else:
+                            module = targeter.get_component_module(layer_idx, component)
+                            if module is not None:
+                                key = f"layer{layer_idx}_{component}"
+                                if key in saved_weights:
+                                    module.weight.data = saved_weights[key]
+    
+    return output
+
+
+# Convenience functions for common use cases
+def ablate_attention_only(
+    model_path: str,
+    text_input: str,
+    ablation_strategy: str = "zero_out",
+    severity: float = 0.5,
+    target_layers: Optional[Union[int, List[int]]] = None,
+    **kwargs
+) -> str:
+    """Ablate only attention components."""
+    return targeted_ablate(
+        model_path=model_path,
+        ablation_strategy=ablation_strategy,
+        severity=severity,
+        text_input=text_input,
+        target_layers=target_layers,
+        target_components=['q', 'k', 'v', 'o'],
+        **kwargs
+    )
+
+
+def ablate_mlp_only(
+    model_path: str,
+    text_input: str,
+    ablation_strategy: str = "zero_out",
+    severity: float = 0.5,
+    target_layers: Optional[Union[int, List[int]]] = None,
+    **kwargs
+) -> str:
+    """Ablate only MLP/FFN components."""
+    return targeted_ablate(
+        model_path=model_path,
+        ablation_strategy=ablation_strategy,
+        severity=severity,
+        text_input=text_input,
+        target_layers=target_layers,
+        target_components=['mlp'],
+        **kwargs
+    )
+
+
+def ablate_layer_range(
+    model_path: str,
+    text_input: str,
+    start_layer: int,
+    end_layer: int,
+    ablation_strategy: str = "zero_out",
+    severity: float = 0.5,
+    target_components: Optional[List[str]] = None,
+    **kwargs
+) -> str:
+    """Ablate a range of layers."""
+    return targeted_ablate(
+        model_path=model_path,
+        ablation_strategy=ablation_strategy,
+        severity=severity,
+        text_input=text_input,
+        target_layers=list(range(start_layer, end_layer + 1)),
+        target_components=target_components,
+        **kwargs
+    )
