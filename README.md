@@ -20,7 +20,7 @@ The library is designed for efficiency and ease of use, featuring a high-level `
 To get started, clone the repository and install it in editable mode:
 
 ```bash
-git clone https://github.com/your-username/llm-aphasia.git
+git clone https://github.com/NathanRoll1/llm-aphasia.git
 cd llm-aphasia
 pip install -e .
 ```
